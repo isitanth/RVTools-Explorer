@@ -21,9 +21,30 @@
 #   - OS and cluster distribution
 #   - Density and ratio metrics
 #
+# License:
+# This script is provided "as-is" for internal use within Orange Business.
+# Redistribution or commercial use is not permitted without explicit approval.
+#
 # ==============================================================================
 
 set -euo pipefail
+#set -x
+
+# Utility to find the column index (1-based) from header by name (case-insensitive)
+find_column_index() {
+    local file="$1"
+    local name="$2"
+    awk -F";" -v name="$name" 'NR==1 {
+        for (i=1; i<=NF; i++) {
+            col=tolower($i); gsub(/^ +| +$/, "", col)
+            if (col == tolower(name)) {
+                print i
+                exit
+            }
+        }
+        exit 1
+    }' "$file"
+}
 
 # === Input CSV files ===
 VCPU="vCPU-Tableau 1.csv"
@@ -42,13 +63,36 @@ done
 
 echo "===== RVTools Compute Summary ====="
 
-vcpus=$(LC_ALL=C awk -F";" 'NR > 1 && $5 ~ /^[0-9]/ {gsub("[^0-9]", "", $5); sum += $5} END {print sum}' "$VCPU")
-ram=$(LC_ALL=C awk -F";" 'NR > 1 && $5 ~ /^[0-9]/ {gsub("[^0-9]", "", $5); sum += $5} END {printf "%.0f", sum / 1024}' "$VMEM")
-disk=$(LC_ALL=C awk -F";" 'NR > 1 && $7 ~ /^[0-9]/ {gsub("[^0-9]", "", $7); sum += $7} END {print int(sum / 1024)}' "$VPART")
+# Dynamically detect required columns
+vcpus_col=$(find_column_index "$VCPU" "CPUs")
+ram_col=$(find_column_index "$VMEM" "Size MiB")
+disk_col=$(find_column_index "$VPART" "Capacity MiB")
+
+if [[ -z "$vcpus_col" || -z "$ram_col" || -z "$disk_col" ]]; then
+    echo "Error: One or more required columns not found in input files."
+    echo "Check if 'CPUs' in $VCPU, and 'Provisioned MB' in $VMEM and $VPART exist."
+    exit 1
+fi
+
+# Compute vCPUs
+vcpus=$(LC_ALL=C awk -F";" -v col="$vcpus_col" 'NR > 1 && $col ~ /^[0-9]/ {
+    gsub("[^0-9]", "", $col); sum += $col
+} END {print sum}' "$VCPU")
+
+# Compute RAM
+ram=$(LC_ALL=C awk -F";" -v col="$ram_col" 'NR > 1 && $col ~ /^[0-9]/ {
+    gsub("[^0-9]", "", $col); sum += $col
+} END {printf "%.0f", sum / 1024}' "$VMEM")
+
+# Compute Disk
+disk=$(LC_ALL=C awk -F";" -v col="$disk_col" 'NR > 1 && $col ~ /^[0-9]/ {
+    gsub("[^0-9]", "", $col); sum += $col
+} END {print int(sum / 1024)}' "$VPART")
 
 echo "Total vCPUs provisioned: $vcpus"
 echo "Total RAM provisioned (GiB): $ram"
 echo "Total VM disk provisioned (GiB): $disk"
+
 
 read ds_total ds_free <<< $(LC_ALL=C awk -F";" 'NR > 1 {
     gsub("[^0-9]", "", $8); total += $8
@@ -98,41 +142,45 @@ thick=$(awk -F";" 'NR > 1 && tolower($7) == "false" {n++} END {print n+0}' "$VDI
 echo "Thin-provisioned disks: $thin"
 echo "Thick-provisioned disks: $thick"
 
-echo "VM hardware versions:"
-awk -F";" 'NR > 1 && $68 != "" {v[$68]++} END {for (h in v) printf "  VMX %s: %d\n", h, v[h]}' "$VINFO"
-
-LC_ALL=C awk -F";" 'NR > 1 {
-    val1 = $5; gsub("[^0-9]", "", val1); prov += val1
-    val2 = $9; gsub("[^0-9]", "", val2); used += val2
-} END {
-    printf "RAM provisioned (GiB): %.0f\n", prov / 1024
-    printf "RAM consumed (GiB): %.0f\n", used / 1024
-    printf "RAM overcommit ratio: %.2f\n", prov / used
-}' "$VMEM"
+echo "VM hardware versions (Type Vers : Quantity):"
+hwver_col=$(head -1 "$VINFO" | tr ";" "\n" | nl | grep -i "^.*HW version$" | awk '{print $1}')
+awk -F";" -v col="$hwver_col" 'NR > 1 && $col != "" {v[$col]++}
+END {
+    for (h in v) {
+        printf "  VMX %s: %d\n", h, v[h]
+    }
+}' "$VINFO" | sort -k2 -nr
 
 echo ""
+#####
+# Here I've faced column parsing issue, now using text column detection for more flexibility and avoid similar issues.
 echo "===== VM Count per OS (VMware Tools) ====="
-awk -F";" 'NR > 1 && $82 != "" { os[$82]++ }
+os_col=$(head -1 "$VINFO" | tr ";" "\n" | nl | grep -i "OS according to the VMware Tools" | awk '{print $1}')
+awk -F";" -v col="$os_col" 'NR > 1 && $col != "" { os[$col]++ }
 END {
     for (o in os) {
         printf "%4d  %s\n", os[o], o
     }
 }' "$VINFO" | sort -nr
-
+#####
 echo ""
-
 echo "===== VM Distribution by Cluster ====="
-# Initialize cluster VM count
-vm_count_in_clusters=0
-awk -F";" 'NR > 1 && $79 != "" { cluster[$79]++ }
+# Identify correct column index for "Cluster"
+cluster_col=$(head -1 "$VINFO" | tr ";" "\n" | nl | grep -i "^.*Cluster$" | awk '{print $1}')
+
+# Compute VM counts per cluster and save to temp
+awk -F";" -v col="$cluster_col" 'NR > 1 && $col != "" { cluster[$col]++ }
 END {
     for (c in cluster) {
         printf "%4d  %s\n", cluster[c], c
     }
 }' "$VINFO" | sort -nr | tee /tmp/cluster_count.tmp
+
 # Calculate the sum of VMs from cluster distribution
 vm_count_in_clusters=$(awk '{sum += $1} END {print sum}' /tmp/cluster_count.tmp)
 rm /tmp/cluster_count.tmp
+
+# Compare with total VM count
 echo "Cluster assignment checksum: $vm_count_in_clusters VMs assigned to clusters out of $total_vms total VMs"
 if [ "$vm_count_in_clusters" -eq "$total_vms" ]; then
     echo "Result: VM-to-cluster mapping is consistent."
